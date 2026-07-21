@@ -13,7 +13,7 @@ GitHub Actions deploy of [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
 | `POSTGRES_PASSWORD` | yes | DB password |
 | `CF_TUNNEL_TOKEN` | no | Cloudflare Tunnel token for public URL |
 
-Backup repo: `jjjjllll111/db-storage` (`data.tar.gz`).
+Backup repo: `jjjjllll111/db-storage` (`sub2api-data.tar.gz`).
 
 ## Run
 
