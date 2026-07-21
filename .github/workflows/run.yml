@@ -59,6 +59,31 @@ jobs:
           else
             echo "[*] no prior backup; fresh start"
           fi
+          # WARP SOCKS5 sidecar on same compose network (not host 127.0.0.1)
+          cat > deploy/docker-compose.warp.yml <<'YAML'
+          services:
+            warp:
+              image: seiry/cloudflare-warp-proxy
+              container_name: sub2api-warp
+              restart: unless-stopped
+              networks:
+                - sub2api-network
+              logging:
+                driver: json-file
+                options:
+                  max-size: 1m
+                  max-file: "2"
+            sub2api:
+              environment:
+                - HTTP_PROXY=socks5://warp:40000
+                - HTTPS_PROXY=socks5://warp:40000
+                - ALL_PROXY=socks5://warp:40000
+                - NO_PROXY=localhost,127.0.0.1,postgres,redis,warp
+                - UPDATE_PROXY_URL=socks5://warp:40000
+              depends_on:
+                - warp
+          YAML
+          sed -i 's/^[[:space:]]*//' deploy/docker-compose.warp.yml
           JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
           TOTP_ENCRYPTION_KEY="${TOTP_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
           POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 32)}"
@@ -77,18 +102,45 @@ jobs:
           JWT_SECRET=${JWT_SECRET}
           TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY}
           AUTO_SETUP=true
+          UPDATE_PROXY_URL=socks5://warp:40000
           EOF
           # strip accidental leading spaces from heredoc
           sed -i 's/^[[:space:]]*//' deploy/.env
           chmod 600 deploy/.env
           echo "ADMIN_PASSWORD=$ADMIN_PASSWORD" >> "$GITHUB_ENV"
-          echo "[*] .env ready"
+          echo "COMPOSE_FILE=docker-compose.yml:docker-compose.warp.yml" >> "$GITHUB_ENV"
+          echo "[*] .env + warp overlay ready"
 
-      - name: Start Sub2API (docker compose)
+      - name: Start Sub2API (docker compose + warp)
         working-directory: deploy
+        env:
+          COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
         run: |
           set -Eeuo pipefail
           docker compose pull
+          docker compose up -d warp
+          # wait SOCKS (proxy mode enroll; probe via sibling curl container)
+          ready=0
+          for i in $(seq 1 40); do
+            if ! docker compose ps --status running --services 2>/dev/null | grep -qx warp; then
+              sleep 3
+              continue
+            fi
+            net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' sub2api-warp 2>/dev/null || true)
+            if [ -n "$net" ] && docker run --rm --network "$net" curlimages/curl:8.5.0 \
+                -sf --connect-timeout 5 -x socks5h://warp:40000 \
+                https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q 'warp=on'; then
+              echo "[*] warp socks ready"
+              ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$ready" != "1" ]; then
+            echo "[!] warp not ready; logs:"
+            docker compose logs --tail=80 warp || true
+            exit 1
+          fi
           docker compose up -d
           for i in $(seq 1 90); do
             c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/health 2>/dev/null || echo 000)
@@ -103,9 +155,13 @@ jobs:
             echo "[!] health failed: $c"
             docker compose ps
             docker compose logs --tail=80 sub2api || true
+            docker compose logs --tail=40 warp || true
             exit 1
           }
           docker compose ps
+          net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' sub2api-warp 2>/dev/null || true)
+          [ -n "$net" ] && docker run --rm --network "$net" curlimages/curl:8.5.0 \
+            -s -x socks5h://warp:40000 https://www.cloudflare.com/cdn-cgi/trace || true
           echo "[*] admin password available in job env (secret-sourced)"
 
       - name: Start Cloudflare Tunnel (optional)
@@ -118,21 +174,24 @@ jobs:
           fi
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-          nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" > tunnel.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" > "$GITHUB_WORKSPACE/tunnel.log" 2>&1 &
           echo $! > /tmp/cloudflared.pid
           sleep 6
-          tail -20 tunnel.log || true
+          tail -20 "$GITHUB_WORKSPACE/tunnel.log" || true
           echo "tunnel_enabled=1" >> "$GITHUB_ENV"
 
       - name: Keep alive + checkpoint backup
+        working-directory: deploy
+        env:
+          COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
         run: |
           set -Eeuo pipefail
           backup() {
             local msg="${1:-backup}"
-            (cd deploy && tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
-              data postgres_data redis_data .env 2>/dev/null) || return 1
-            mv db-repo/sub2api-data.tar.gz.tmp db-repo/sub2api-data.tar.gz
-            (set -e; cd db-repo
+            tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
+              data postgres_data redis_data .env 2>/dev/null || return 1
+            mv ../db-repo/sub2api-data.tar.gz.tmp ../db-repo/sub2api-data.tar.gz
+            (set -e; cd ../db-repo
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
               git add sub2api-data.tar.gz
@@ -146,14 +205,18 @@ jobs:
               CF=$(cat /tmp/cloudflared.pid 2>/dev/null || echo 0)
               if [ "$CF" -gt 0 ] && ! kill -0 "$CF" 2>/dev/null; then
                 echo "[$(date)] cloudflared died, restarting"
-                nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" > tunnel.log 2>&1 &
+                nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" > "$GITHUB_WORKSPACE/tunnel.log" 2>&1 &
                 echo $! > /tmp/cloudflared.pid
                 sleep 3
               fi
             fi
+            if ! docker compose ps --status running --services 2>/dev/null | grep -qx warp; then
+              echo "[$(date)] warp down — restarting"
+              docker compose up -d warp || true
+            fi
             if ! curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
               echo "[$(date)] app unresponsive — restarting compose"
-              (cd deploy && docker compose up -d) || true
+              docker compose up -d || true
             fi
             NOW=$(date +%s)
             if [ $((NOW - LAST)) -ge 600 ]; then
@@ -165,14 +228,18 @@ jobs:
 
       - name: Final diagnostics + backup
         if: always()
+        env:
+          COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
         run: |
           set -Eeuo pipefail
           echo "=== docker ps ==="
           docker ps -a || true
           echo "=== sub2api logs ==="
           (cd deploy && docker compose logs --tail=100 sub2api) || true
+          echo "=== warp logs ==="
+          (cd deploy && docker compose logs --tail=60 warp) || true
           echo "=== tunnel.log ==="
-          tail -40 tunnel.log 2>/dev/null || true
+          tail -40 "$GITHUB_WORKSPACE/tunnel.log" 2>/dev/null || true
           if [ -d deploy ]; then
             (cd deploy && tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
               data postgres_data redis_data .env 2>/dev/null) && \
