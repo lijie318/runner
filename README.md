@@ -1,4 +1,4 @@
-# sub2api-runner
+# runner
 
 GitHub Actions deploy of [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api).
 
@@ -13,11 +13,11 @@ GitHub Actions deploy of [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
 | `POSTGRES_PASSWORD` | yes | DB password |
 | `CF_TUNNEL_TOKEN` | no | Cloudflare Tunnel token for public URL |
 
-Backup repo: `${owner}/sub2api-storage` (`data.tar.gz`).
+Backup repo: `${owner}/storage` (`data.tar.gz`).
 
 ## Run
 
 ```bash
-gh workflow run run.yml -R <owner>/sub2api-runner
-gh run watch -R <owner>/sub2api-runner
+gh workflow run run.yml -R <owner>/runner
+gh run watch -R <owner>/runner
 ```

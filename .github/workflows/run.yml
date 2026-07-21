@@ -40,7 +40,7 @@ jobs:
       - name: Checkout backup repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/sub2api-storage
+          repository: ${{ github.repository_owner }}/storage
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: db-repo
           fetch-depth: 1
