@@ -52,10 +52,19 @@ jobs:
           mkdir -p deploy
           cp sub2api/deploy/docker-compose.local.yml deploy/docker-compose.yml
           mkdir -p deploy/data deploy/postgres_data deploy/redis_data
-          # restore previous data if present
+          # restore: empty/corrupt tar = fresh (current artifact is 544B empty dirs)
+          MIN_BACKUP=10000
           if [ -f db-repo/sub2api-data.tar.gz ]; then
-            tar -xzf db-repo/sub2api-data.tar.gz -C deploy
-            echo "[*] restored sub2api-data.tar.gz"
+            sz=$(stat -c%s db-repo/sub2api-data.tar.gz)
+            if [ "$sz" -lt "$MIN_BACKUP" ]; then
+              echo "[!] backup too small (${sz}B) — treating as empty, fresh start"
+            else
+              # sudo: postgres_data files are root/uid70 owned
+              sudo tar -xzf db-repo/sub2api-data.tar.gz -C deploy
+              echo "[*] restored sub2api-data.tar.gz (${sz}B)"
+              # show what landed
+              sudo du -sh deploy/data deploy/postgres_data deploy/redis_data 2>/dev/null || true
+            fi
           else
             echo "[*] no prior backup; fresh start"
           fi
@@ -84,11 +93,20 @@ jobs:
                 - warp
           YAML
           sed -i 's/^          //' deploy/docker-compose.warp.yml
-          JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
-          TOTP_ENCRYPTION_KEY="${TOTP_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
-          POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 32)}"
-          ADMIN_PASSWORD="${ADMIN_PASSWORD:-$(openssl rand -hex 12)}"
-          cat > deploy/.env <<EOF
+          # keep restored .env (JWT/DB secrets must match data); only create if missing
+          if [ -f deploy/.env ]; then
+            echo "[*] keeping restored .env"
+            # shellcheck: KEY=VAL only
+            set -a
+            # shellcheck disable=SC1091
+            source deploy/.env
+            set +a
+          else
+            JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
+            TOTP_ENCRYPTION_KEY="${TOTP_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
+            POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 32)}"
+            ADMIN_PASSWORD="${ADMIN_PASSWORD:-$(openssl rand -hex 12)}"
+            cat > deploy/.env <<EOF
           BIND_HOST=127.0.0.1
           SERVER_PORT=8080
           SERVER_MODE=release
@@ -104,9 +122,11 @@ jobs:
           AUTO_SETUP=true
           UPDATE_PROXY_URL=socks5://warp:40000
           EOF
-          sed -i 's/^          //' deploy/.env
+            sed -i 's/^          //' deploy/.env
+            echo "[*] wrote fresh .env"
+          fi
           chmod 600 deploy/.env
-          echo "ADMIN_PASSWORD=$ADMIN_PASSWORD" >> "$GITHUB_ENV"
+          echo "ADMIN_PASSWORD=${ADMIN_PASSWORD:-}" >> "$GITHUB_ENV"
           echo "COMPOSE_FILE=docker-compose.yml:docker-compose.warp.yml" >> "$GITHUB_ENV"
           echo "[*] .env + warp overlay ready"
 
@@ -185,18 +205,36 @@ jobs:
           COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
         run: |
           set -Eeuo pipefail
+          # postgres_data owned by container root/uid70 — need sudo; never swallow errors
           backup() {
             local msg="${1:-backup}"
-            tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
-              data postgres_data redis_data .env 2>/dev/null || return 1
-            mv ../db-repo/sub2api-data.tar.gz.tmp ../db-repo/sub2api-data.tar.gz
+            local out="../db-repo/sub2api-data.tar.gz.tmp"
+            local min=10000
+            sudo tar -czf "$out" data postgres_data redis_data .env || {
+              echo "[!] tar failed"; return 1
+            }
+            local sz
+            sz=$(stat -c%s "$out")
+            echo "[*] backup tar ${sz}B"
+            if [ "$sz" -lt "$min" ]; then
+              echo "[!] backup too small (${sz}B) — not publishing (would wipe real data)"
+              rm -f "$out"
+              return 1
+            fi
+            # must contain postgres files, not empty dirs only
+            if ! sudo tar -tzf "$out" | grep -q 'postgres_data/.'; then
+              echo "[!] backup has empty postgres_data — not publishing"
+              rm -f "$out"
+              return 1
+            fi
+            mv "$out" ../db-repo/sub2api-data.tar.gz
             (set -e; cd ../db-repo
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
               git add sub2api-data.tar.gz
               git commit -m "$msg" --allow-empty
               git push origin HEAD:main) || { echo "[!] publish failed; retry next checkpoint"; return 0; }
-            echo "[*] published $msg"
+            echo "[*] published $msg (${sz}B)"
           }
           END=$((SECONDS + RUN_DURATION)); LAST=0
           while [ $SECONDS -lt $END ]; do
@@ -239,17 +277,28 @@ jobs:
           (cd deploy && docker compose logs --tail=60 warp) || true
           echo "=== tunnel.log ==="
           tail -40 "$GITHUB_WORKSPACE/tunnel.log" 2>/dev/null || true
-          if [ -d deploy ]; then
-            (cd deploy && tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
-              data postgres_data redis_data .env 2>/dev/null) && \
-              mv db-repo/sub2api-data.tar.gz.tmp db-repo/sub2api-data.tar.gz || true
+          if [ ! -d deploy ]; then
+            echo "[!] no deploy dir — skip final backup"
+            exit 0
           fi
-          if [ -f db-repo/sub2api-data.tar.gz ]; then
-            (cd db-repo
-              git config user.name "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add sub2api-data.tar.gz
-              git commit -m "final backup" --allow-empty
-              git push origin HEAD:main) || echo "[!] final publish failed"
-            echo "[*] final backup published"
+          out=db-repo/sub2api-data.tar.gz.tmp
+          min=10000
+          if (cd deploy && sudo tar -czf "../$out" data postgres_data redis_data .env); then
+            sz=$(stat -c%s "$out")
+            echo "[*] final tar ${sz}B"
+            if [ "$sz" -ge "$min" ] && sudo tar -tzf "$out" | grep -q 'postgres_data/.'; then
+              mv "$out" db-repo/sub2api-data.tar.gz
+              (cd db-repo
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git add sub2api-data.tar.gz
+                git commit -m "final backup" --allow-empty
+                git push origin HEAD:main) || echo "[!] final publish failed"
+              echo "[*] final backup published (${sz}B)"
+            else
+              echo "[!] final backup empty/invalid (${sz}B) — not publishing"
+              rm -f "$out"
+            fi
+          else
+            echo "[!] final tar failed"
           fi
