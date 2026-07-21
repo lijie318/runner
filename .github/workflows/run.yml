@@ -40,7 +40,7 @@ jobs:
       - name: Checkout backup repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/storage
+          repository: jjjjllll111/db-storage
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: db-repo
           fetch-depth: 1
@@ -53,9 +53,9 @@ jobs:
           cp sub2api/deploy/docker-compose.local.yml deploy/docker-compose.yml
           mkdir -p deploy/data deploy/postgres_data deploy/redis_data
           # restore previous data if present
-          if [ -f db-repo/data.tar.gz ]; then
-            tar -xzf db-repo/data.tar.gz -C deploy
-            echo "[*] restored data.tar.gz"
+          if [ -f db-repo/sub2api-data.tar.gz ]; then
+            tar -xzf db-repo/sub2api-data.tar.gz -C deploy
+            echo "[*] restored sub2api-data.tar.gz"
           else
             echo "[*] no prior backup; fresh start"
           fi
@@ -129,13 +129,13 @@ jobs:
           set -Eeuo pipefail
           backup() {
             local msg="${1:-backup}"
-            (cd deploy && tar -czf ../db-repo/data.tar.gz.tmp \
+            (cd deploy && tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
               data postgres_data redis_data .env 2>/dev/null) || return 1
-            mv db-repo/data.tar.gz.tmp db-repo/data.tar.gz
+            mv db-repo/sub2api-data.tar.gz.tmp db-repo/sub2api-data.tar.gz
             (set -e; cd db-repo
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add data.tar.gz
+              git add sub2api-data.tar.gz
               git commit -m "$msg" --allow-empty
               git push origin HEAD:main) || { echo "[!] publish failed; retry next checkpoint"; return 0; }
             echo "[*] published $msg"
@@ -174,15 +174,15 @@ jobs:
           echo "=== tunnel.log ==="
           tail -40 tunnel.log 2>/dev/null || true
           if [ -d deploy ]; then
-            (cd deploy && tar -czf ../db-repo/data.tar.gz.tmp \
+            (cd deploy && tar -czf ../db-repo/sub2api-data.tar.gz.tmp \
               data postgres_data redis_data .env 2>/dev/null) && \
-              mv db-repo/data.tar.gz.tmp db-repo/data.tar.gz || true
+              mv db-repo/sub2api-data.tar.gz.tmp db-repo/sub2api-data.tar.gz || true
           fi
-          if [ -f db-repo/data.tar.gz ]; then
+          if [ -f db-repo/sub2api-data.tar.gz ]; then
             (cd db-repo
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add data.tar.gz
+              git add sub2api-data.tar.gz
               git commit -m "final backup" --allow-empty
               git push origin HEAD:main) || echo "[!] final publish failed"
             echo "[*] final backup published"

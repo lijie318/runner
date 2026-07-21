@@ -22,11 +22,8 @@ jobs:
         run: sleep 30
 
       - name: Trigger next run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -sf -X POST \
-            -H "Authorization: Bearer ${{ secrets.PRIVATE_REPO_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Content-Type: application/json" \
-            -d '{"ref":"main"}' \
-            "https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/actions/workflows/run.yml/dispatches"
+          gh workflow run run.yml -R "${{ github.repository }}" --ref main
           echo "Next Sub2API run triggered"
