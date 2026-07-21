@@ -9,14 +9,11 @@ permissions:
   actions: write
   contents: read
 
-concurrency:
-  group: relay-group
-  cancel-in-progress: true
-
+# no cancel-in-progress: failure-triggered skip must not cancel a success-triggered sleep
 jobs:
   relay:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Wait before next run
         run: sleep 30
@@ -25,5 +22,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -Eeuo pipefail
+          echo "parent conclusion=${{ github.event.workflow_run.conclusion }} id=${{ github.event.workflow_run.id }}"
           gh workflow run run.yml -R "${{ github.repository }}" --ref main
           echo "Next Sub2API run triggered"
