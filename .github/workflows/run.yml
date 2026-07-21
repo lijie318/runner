@@ -13,10 +13,8 @@ concurrency:
 env:
   PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
   CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-  ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-  JWT_SECRET: ${{ secrets.JWT_SECRET }}
-  TOTP_ENCRYPTION_KEY: ${{ secrets.TOTP_ENCRYPTION_KEY }}
-  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+  MANAGEMENT_PASSWORD: ${{ secrets.MANAGEMENT_PASSWORD }}
+  API_KEY: ${{ secrets.API_KEY }}
   RUN_DURATION: 19800
 
 jobs:
@@ -30,11 +28,11 @@ jobs:
       - name: Checkout runner repo
         uses: actions/checkout@v4
 
-      - name: Checkout Sub2API deploy files
+      - name: Checkout CLIProxyAPI
         uses: actions/checkout@v4
         with:
-          repository: Wei-Shaw/sub2api
-          path: sub2api
+          repository: router-for-me/CLIProxyAPI
+          path: cliproxy
           fetch-depth: 1
 
       - name: Checkout backup repository
@@ -50,102 +48,107 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p deploy
-          cp sub2api/deploy/docker-compose.local.yml deploy/docker-compose.yml
-          mkdir -p deploy/data deploy/postgres_data deploy/redis_data
-          # restore: empty/corrupt tar = fresh (current artifact is 544B empty dirs)
-          MIN_BACKUP=10000
-          if [ -f db-repo/sub2api-data.tar.gz ]; then
-            sz=$(stat -c%s db-repo/sub2api-data.tar.gz)
+          cp cliproxy/docker-compose.yml deploy/docker-compose.yml
+          mkdir -p deploy/auths deploy/logs deploy/plugins
+          # restore previous data if present (config + auths + logs)
+          MIN_BACKUP=200
+          if [ -f db-repo/cliproxy-data.tar.gz ]; then
+            sz=$(stat -c%s db-repo/cliproxy-data.tar.gz)
             if [ "$sz" -lt "$MIN_BACKUP" ]; then
-              echo "[!] backup too small (${sz}B) — treating as empty, fresh start"
+              echo "[!] backup too small (${sz}B) — fresh start"
             else
-              # sudo: postgres_data files are root/uid70 owned
-              sudo tar -xzf db-repo/sub2api-data.tar.gz -C deploy
-              echo "[*] restored sub2api-data.tar.gz (${sz}B)"
-              # show what landed
-              sudo du -sh deploy/data deploy/postgres_data deploy/redis_data 2>/dev/null || true
+              sudo tar -xzf db-repo/cliproxy-data.tar.gz -C deploy
+              echo "[*] restored cliproxy-data.tar.gz (${sz}B)"
+              sudo du -sh deploy/auths deploy/logs deploy/plugins deploy/config.yaml 2>/dev/null || true
             fi
           else
             echo "[*] no prior backup; fresh start"
           fi
-          # WARP overlay: keep workflow-YAML indent, strip fixed 10 spaces only
+          # config.yaml — keep restored; else seed from example
+          if [ ! -f deploy/config.yaml ]; then
+            cp cliproxy/config.example.yaml deploy/config.yaml
+            export API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
+            export MANAGEMENT_PASSWORD="${MANAGEMENT_PASSWORD:-$(openssl rand -hex 12)}"
+            python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path("deploy/config.yaml")
+          text = p.read_text(encoding="utf-8")
+          key = os.environ["API_KEY"]
+          mgmt = os.environ["MANAGEMENT_PASSWORD"]
+          text = re.sub(
+              r"api-keys:\n(?:\s*-\s*\"[^\"]*\"\n)+",
+              f'api-keys:\n  - "{key}"\n',
+              text,
+              count=1,
+          )
+          text = re.sub(
+              r"(allow-remote:\s*)\S+",
+              r"\1true",
+              text,
+              count=1,
+          )
+          text = re.sub(
+              r'(secret-key:\s*)""',
+              rf'\1"{mgmt}"',
+              text,
+              count=1,
+          )
+          p.write_text(text, encoding="utf-8")
+          print("[*] wrote fresh config.yaml")
+          PY
+            echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
+            echo "MANAGEMENT_PASSWORD=$MANAGEMENT_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "[*] keeping restored config.yaml"
+          fi
+          # warp overlay — service name matches CLIProxyAPI compose
           cat > deploy/docker-compose.warp.yml <<'YAML'
           services:
             warp:
               image: seiry/cloudflare-warp-proxy
-              container_name: sub2api-warp
+              container_name: cliproxy-warp
               restart: unless-stopped
-              networks:
-                - sub2api-network
               logging:
                 driver: json-file
                 options:
                   max-size: 1m
                   max-file: "2"
-            sub2api:
+            cli-proxy-api:
               environment:
                 - HTTP_PROXY=socks5://warp:40000
                 - HTTPS_PROXY=socks5://warp:40000
                 - ALL_PROXY=socks5://warp:40000
-                - NO_PROXY=localhost,127.0.0.1,postgres,redis,warp
-                - UPDATE_PROXY_URL=socks5://warp:40000
+                - NO_PROXY=localhost,127.0.0.1,warp
+                - MANAGEMENT_PASSWORD=${MANAGEMENT_PASSWORD:-}
               depends_on:
                 - warp
           YAML
           sed -i 's/^          //' deploy/docker-compose.warp.yml
-          # keep restored .env (JWT/DB secrets must match data); only create if missing
-          if [ -f deploy/.env ]; then
-            echo "[*] keeping restored .env"
-            # shellcheck: KEY=VAL only
-            set -a
-            # shellcheck disable=SC1091
-            source deploy/.env
-            set +a
-          else
-            JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 32)}"
-            TOTP_ENCRYPTION_KEY="${TOTP_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
-            POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 32)}"
-            ADMIN_PASSWORD="${ADMIN_PASSWORD:-$(openssl rand -hex 12)}"
-            cat > deploy/.env <<EOF
-          BIND_HOST=127.0.0.1
-          SERVER_PORT=8080
-          SERVER_MODE=release
-          RUN_MODE=standard
-          TZ=Asia/Shanghai
-          POSTGRES_USER=sub2api
-          POSTGRES_DB=sub2api
-          POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-          ADMIN_EMAIL=admin@sub2api.local
-          ADMIN_PASSWORD=${ADMIN_PASSWORD}
-          JWT_SECRET=${JWT_SECRET}
-          TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY}
-          AUTO_SETUP=true
-          UPDATE_PROXY_URL=socks5://warp:40000
-          EOF
-            sed -i 's/^          //' deploy/.env
-            echo "[*] wrote fresh .env"
-          fi
-          chmod 600 deploy/.env
-          echo "ADMIN_PASSWORD=${ADMIN_PASSWORD:-}" >> "$GITHUB_ENV"
+          # bind host ports only on 127.0.0.1 (tunnel fronts public)
+          sed -i 's/"8317:8317"/"127.0.0.1:8317:8317"/; s/"8085:8085"/"127.0.0.1:8085:8085"/; s/"1455:1455"/"127.0.0.1:1455:1455"/; s/"54545:54545"/"127.0.0.1:54545:54545"/; s/"51121:51121"/"127.0.0.1:51121:51121"/; s/"11451:11451"/"127.0.0.1:11451:11451"/' deploy/docker-compose.yml
           echo "COMPOSE_FILE=docker-compose.yml:docker-compose.warp.yml" >> "$GITHUB_ENV"
-          echo "[*] .env + warp overlay ready"
+          echo "[*] deploy ready"
 
-      - name: Start Sub2API (docker compose + warp)
+      - name: Start CLIProxyAPI (docker compose + warp)
         working-directory: deploy
         env:
           COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
+          CLI_PROXY_CONFIG_PATH: ./config.yaml
+          CLI_PROXY_AUTH_PATH: ./auths
+          CLI_PROXY_LOG_PATH: ./logs
+          CLI_PROXY_PLUGIN_PATH: ./plugins
+          MANAGEMENT_PASSWORD: ${{ env.MANAGEMENT_PASSWORD }}
         run: |
           set -Eeuo pipefail
           docker compose pull
           docker compose up -d warp
-          # wait SOCKS (proxy mode enroll; probe via sibling curl container)
           ready=0
           for i in $(seq 1 40); do
             if ! docker compose ps --status running --services 2>/dev/null | grep -qx warp; then
               sleep 3
               continue
             fi
-            net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' sub2api-warp 2>/dev/null || true)
+            net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' cliproxy-warp 2>/dev/null || true)
             if [ -n "$net" ] && docker run --rm --network "$net" curlimages/curl:8.5.0 \
                 -sf --connect-timeout 5 -x socks5h://warp:40000 \
                 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q 'warp=on'; then
@@ -161,27 +164,27 @@ jobs:
             exit 1
           fi
           docker compose up -d
+          # port 8317 — any HTTP response means process up (401/404 ok)
           for i in $(seq 1 90); do
-            c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/health 2>/dev/null || echo 000)
-            if [ "$c" = "200" ] || [ "$c" = "204" ]; then
-              echo "[*] sub2api up ($c)"
+            c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8317/ 2>/dev/null || echo 000)
+            if [ "$c" != "000" ] && [ "$c" != "000000" ]; then
+              echo "[*] cliproxy up (http $c)"
               break
             fi
             sleep 2
           done
-          c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/health 2>/dev/null || echo 000)
-          [ "$c" = "200" ] || [ "$c" = "204" ] || {
+          c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8317/ 2>/dev/null || echo 000)
+          [ "$c" != "000" ] && [ "$c" != "000000" ] || {
             echo "[!] health failed: $c"
             docker compose ps
-            docker compose logs --tail=80 sub2api || true
+            docker compose logs --tail=100 cli-proxy-api || true
             docker compose logs --tail=40 warp || true
             exit 1
           }
           docker compose ps
-          net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' sub2api-warp 2>/dev/null || true)
+          net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' cliproxy-warp 2>/dev/null || true)
           [ -n "$net" ] && docker run --rm --network "$net" curlimages/curl:8.5.0 \
             -s -x socks5h://warp:40000 https://www.cloudflare.com/cdn-cgi/trace || true
-          echo "[*] admin password available in job env (secret-sourced)"
 
       - name: Start Cloudflare Tunnel (optional)
         run: |
@@ -203,35 +206,42 @@ jobs:
         working-directory: deploy
         env:
           COMPOSE_FILE: docker-compose.yml:docker-compose.warp.yml
+          CLI_PROXY_CONFIG_PATH: ./config.yaml
+          CLI_PROXY_AUTH_PATH: ./auths
+          CLI_PROXY_LOG_PATH: ./logs
+          CLI_PROXY_PLUGIN_PATH: ./plugins
         run: |
           set -Eeuo pipefail
-          # postgres_data owned by container root/uid70 — need sudo; never swallow errors
           backup() {
             local msg="${1:-backup}"
-            local out="../db-repo/sub2api-data.tar.gz.tmp"
-            local min=10000
-            sudo tar -czf "$out" data postgres_data redis_data .env || {
-              echo "[!] tar failed"; return 1
-            }
+            local out="../db-repo/cliproxy-data.tar.gz.tmp"
+            local min=200
+            echo "[*] dir sizes before tar:"
+            sudo du -sh config.yaml auths logs plugins 2>/dev/null || true
+            # only pack what exists
+            local items=()
+            for p in config.yaml auths logs plugins; do
+              [ -e "$p" ] && items+=("$p")
+            done
+            if [ ${#items[@]} -eq 0 ]; then
+              echo "[!] nothing to backup"; return 1
+            fi
+            if ! sudo tar -czf - "${items[@]}" > "$out"; then
+              echo "[!] tar failed"; rm -f "$out"; return 1
+            fi
             local sz
             sz=$(stat -c%s "$out")
             echo "[*] backup tar ${sz}B"
             if [ "$sz" -lt "$min" ]; then
-              echo "[!] backup too small (${sz}B) — not publishing (would wipe real data)"
+              echo "[!] backup too small (${sz}B) — not publishing"
               rm -f "$out"
               return 1
             fi
-            # must contain postgres files, not empty dirs only
-            if ! sudo tar -tzf "$out" | grep -q 'postgres_data/.'; then
-              echo "[!] backup has empty postgres_data — not publishing"
-              rm -f "$out"
-              return 1
-            fi
-            mv "$out" ../db-repo/sub2api-data.tar.gz
+            mv -f "$out" ../db-repo/cliproxy-data.tar.gz
             (set -e; cd ../db-repo
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add sub2api-data.tar.gz
+              git add -f cliproxy-data.tar.gz
               git commit -m "$msg" --allow-empty
               git push origin HEAD:main) || { echo "[!] publish failed; retry next checkpoint"; return 0; }
             echo "[*] published $msg (${sz}B)"
@@ -251,7 +261,8 @@ jobs:
               echo "[$(date)] warp down — restarting"
               docker compose up -d warp || true
             fi
-            if ! curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
+            c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8317/ 2>/dev/null || echo 000)
+            if [ "$c" = "000" ] || [ "$c" = "000000" ]; then
               echo "[$(date)] app unresponsive — restarting compose"
               docker compose up -d || true
             fi
@@ -271,8 +282,8 @@ jobs:
           set -Eeuo pipefail
           echo "=== docker ps ==="
           docker ps -a || true
-          echo "=== sub2api logs ==="
-          (cd deploy && docker compose logs --tail=100 sub2api) || true
+          echo "=== cliproxy logs ==="
+          (cd deploy && docker compose logs --tail=100 cli-proxy-api) || true
           echo "=== warp logs ==="
           (cd deploy && docker compose logs --tail=60 warp) || true
           echo "=== tunnel.log ==="
@@ -281,17 +292,27 @@ jobs:
             echo "[!] no deploy dir — skip final backup"
             exit 0
           fi
-          out=db-repo/sub2api-data.tar.gz.tmp
-          min=10000
-          if (cd deploy && sudo tar -czf "../$out" data postgres_data redis_data .env); then
+          out=db-repo/cliproxy-data.tar.gz.tmp
+          min=200
+          items=()
+          for p in config.yaml auths logs plugins; do
+            [ -e "deploy/$p" ] && items+=("$p")
+          done
+          if [ ${#items[@]} -eq 0 ]; then
+            echo "[!] nothing to backup"
+            exit 0
+          fi
+          echo "[*] final dir sizes:"
+          (cd deploy && sudo du -sh "${items[@]}" 2>/dev/null) || true
+          if (cd deploy && sudo tar -czf - "${items[@]}" > "../$out"); then
             sz=$(stat -c%s "$out")
             echo "[*] final tar ${sz}B"
-            if [ "$sz" -ge "$min" ] && sudo tar -tzf "$out" | grep -q 'postgres_data/.'; then
-              mv "$out" db-repo/sub2api-data.tar.gz
+            if [ "$sz" -ge "$min" ]; then
+              mv -f "$out" db-repo/cliproxy-data.tar.gz
               (cd db-repo
                 git config user.name "github-actions[bot]"
                 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                git add sub2api-data.tar.gz
+                git add -f cliproxy-data.tar.gz
                 git commit -m "final backup" --allow-empty
                 git push origin HEAD:main) || echo "[!] final publish failed"
               echo "[*] final backup published (${sz}B)"
@@ -301,4 +322,5 @@ jobs:
             fi
           else
             echo "[!] final tar failed"
+            rm -f "$out"
           fi
