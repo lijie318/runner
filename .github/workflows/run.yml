@@ -13,7 +13,8 @@ concurrency:
 env:
   PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
   CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-  MANAGEMENT_PASSWORD: ${{ secrets.MANAGEMENT_PASSWORD }}
+  # CF tunnel still points at :8080 (sub2api legacy); socat bridges → :8317
+  MANAGEMENT_PASSWORD: mnbewq321
   API_KEY: ${{ secrets.API_KEY }}
   RUN_DURATION: 19800
 
@@ -64,43 +65,39 @@ jobs:
           else
             echo "[*] no prior backup; fresh start"
           fi
-          # config.yaml — keep restored; else seed from example
+          # config.yaml — seed if missing, always pin management password + allow-remote
           if [ ! -f deploy/config.yaml ]; then
             cp cliproxy/config.example.yaml deploy/config.yaml
-            export API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
-            export MANAGEMENT_PASSWORD="${MANAGEMENT_PASSWORD:-$(openssl rand -hex 12)}"
-            python3 - <<'PY'
+            echo "[*] seeded config.example.yaml"
+          fi
+          export API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
+          export MANAGEMENT_PASSWORD="${MANAGEMENT_PASSWORD:-mnbewq321}"
+          python3 - <<'PY'
           import os, re, pathlib
           p = pathlib.Path("deploy/config.yaml")
           text = p.read_text(encoding="utf-8")
           key = os.environ["API_KEY"]
           mgmt = os.environ["MANAGEMENT_PASSWORD"]
-          text = re.sub(
-              r"api-keys:\n(?:\s*-\s*\"[^\"]*\"\n)+",
-              f'api-keys:\n  - "{key}"\n',
-              text,
-              count=1,
-          )
-          text = re.sub(
-              r"(allow-remote:\s*)\S+",
-              r"\1true",
-              text,
-              count=1,
-          )
-          text = re.sub(
-              r'(secret-key:\s*)""',
-              rf'\1"{mgmt}"',
-              text,
-              count=1,
-          )
+          if "api-keys:" in text:
+              text2 = re.sub(
+                  r"api-keys:\n(?:\s*-\s*\"[^\"]*\"\n)+",
+                  f'api-keys:\n  - "{key}"\n',
+                  text,
+                  count=1,
+              )
+              # only replace placeholders, not an existing real key list that already has our key
+              if f'"{key}"' not in text:
+                  text = text2
+          text = re.sub(r"(allow-remote:\s*)\S+", r"\1true", text, count=1)
+          # secret-key: "" or secret-key: "anything"
+          if re.search(r"secret-key:\s*", text):
+              text = re.sub(r'(secret-key:\s*)(".*?"|\S+)', rf'\1"{mgmt}"', text, count=1)
+          else:
+              text = text.replace("remote-management:", f'remote-management:\n  secret-key: "{mgmt}"', 1)
           p.write_text(text, encoding="utf-8")
-          print("[*] wrote fresh config.yaml")
+          print("[*] config.yaml management password pinned")
           PY
-            echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
-            echo "MANAGEMENT_PASSWORD=$MANAGEMENT_PASSWORD" >> "$GITHUB_ENV"
-          else
-            echo "[*] keeping restored config.yaml"
-          fi
+          echo "MANAGEMENT_PASSWORD=$MANAGEMENT_PASSWORD" >> "$GITHUB_ENV"
           # warp overlay — service name matches CLIProxyAPI compose
           cat > deploy/docker-compose.warp.yml <<'YAML'
           services:
@@ -186,6 +183,21 @@ jobs:
           [ -n "$net" ] && docker run --rm --network "$net" curlimages/curl:8.5.0 \
             -s -x socks5h://warp:40000 https://www.cloudflare.com/cdn-cgi/trace || true
 
+      - name: Bridge :8080 → :8317 (CF tunnel legacy target)
+        run: |
+          set -Eeuo pipefail
+          # tunnel public hostname still routes to http://127.0.0.1:8080 (old sub2api)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq socat
+          # kill stale
+          sudo pkill -f 'socat TCP-LISTEN:8080' 2>/dev/null || true
+          nohup socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:127.0.0.1:8317 \
+            > "$GITHUB_WORKSPACE/socat-8080.log" 2>&1 &
+          echo $! > /tmp/socat8080.pid
+          sleep 1
+          c=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ 2>/dev/null || echo 000)
+          echo "[*] socat 8080→8317 up (probe http $c)"
+
       - name: Start Cloudflare Tunnel (optional)
         run: |
           set -Eeuo pipefail
@@ -200,6 +212,9 @@ jobs:
           echo $! > /tmp/cloudflared.pid
           sleep 6
           tail -20 "$GITHUB_WORKSPACE/tunnel.log" || true
+          # public URL should stop 502 once connector + socat live
+          c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://sub.logincore.me/ 2>/dev/null || echo 000)
+          echo "[*] public https://sub.logincore.me/ → http $c"
           echo "tunnel_enabled=1" >> "$GITHUB_ENV"
 
       - name: Keep alive + checkpoint backup
@@ -256,6 +271,13 @@ jobs:
                 echo $! > /tmp/cloudflared.pid
                 sleep 3
               fi
+            fi
+            SO=$(cat /tmp/socat8080.pid 2>/dev/null || echo 0)
+            if [ "$SO" -gt 0 ] && ! kill -0 "$SO" 2>/dev/null; then
+              echo "[$(date)] socat 8080 bridge died, restarting"
+              nohup socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:127.0.0.1:8317 \
+                > "$GITHUB_WORKSPACE/socat-8080.log" 2>&1 &
+              echo $! > /tmp/socat8080.pid
             fi
             if ! docker compose ps --status running --services 2>/dev/null | grep -qx warp; then
               echo "[$(date)] warp down — restarting"
